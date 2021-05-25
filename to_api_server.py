@@ -1,32 +1,36 @@
 import argparse
+import io
 import logging
+import mimetypes
 import os
+import re
+import uuid
 from types import SimpleNamespace
 import falcon
 from falcon_cors import CORS
 import json
 import waitress
-import time
-
-
-import os
-import random
-import numpy as np
-import torch
 import torch.nn.functional as F
 import argparse
 import time
-from arguments import get_args
-from utils import Timers
-from utils import load_checkpoint_model
-from data_utils.tokenization_gpt2 import GPT2Tokenizer
-from configure_data import configure_data
-import mpu
 
-from fp16 import FP16_Module
-from model import GPT2Model
-from model import DistributedDataParallel as DDP
-from utils import print_rank_0
+import torch
+import torch.nn as nn
+import argparse
+import numpy as np
+import random
+import time
+import shutil
+import os
+
+
+import hparams as hp
+import audio
+import utils
+import dataset
+import text
+import model as M
+import waveglow
 
 USE_TORCH_DDP = False
 
@@ -39,365 +43,133 @@ cors_allow_all = CORS(allow_all_origins=True,
                       allow_credentials_all_origins=True
                       )
 
-# parser = argparse.ArgumentParser()
-# parser.add_argument(
-#     '-p', '--port', default=58100,
-#     help='falcon server port')
-# parser.add_argument(
-#     '-c', '--config_file', default='config/config.json',
-#     help='model config file')
+parser = argparse.ArgumentParser()
+parser.add_argument('--step', type=int, default=0)
+parser.add_argument("--alpha", type=float, default=1.0)
+args = parser.parse_args()
 # args = parser.parse_args()
 port = os.getenv('TO_PORT', 8010)
 device_affinity = os.getenv('DEVICE_AFFINITY', 0)
 # model_config= 'config/config.json'
-torch.cuda.set_device(int(device_affinity))
+#torch.cuda.set_device(int(device_affinity))
+class ImageStore:
+
+    _CHUNK_SIZE_BYTES = 4096
+    _IMAGE_NAME_PATTERN = re.compile(
+        '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-z]{2,4}$'
+    )
+
+    def __init__(self, storage_path, uuidgen=uuid.uuid4, fopen=io.open):
+        self._storage_path = storage_path
+        self._uuidgen = uuidgen
+        self._fopen = fopen
+
+    def save(self, image_stream, image_content_type):
+        ext = mimetypes.guess_extension(image_content_type)
+        name = '{uuid}{ext}'.format(uuid=self._uuidgen(), ext=ext)
+        image_path = os.path.join(self._storage_path, name)
+
+        with self._fopen(image_path, 'wb') as image_file:
+            while True:
+                chunk = image_stream.read(self._CHUNK_SIZE_BYTES)
+                if not chunk:
+                    break
+
+                image_file.write(chunk)
+
+        return name
+
+    def open(self, name):
+        # Always validate untrusted input!
+        if not self._IMAGE_NAME_PATTERN.match(name):
+            raise IOError('File not found')
+
+        image_path = os.path.join(self._storage_path, name)
+        stream = self._fopen(image_path, 'rb')
+        content_length = os.path.getsize(image_path)
+
+        return stream, content_length
 
 class TorchResource:
 
     def __init__(self):
         logger.info("...")
         # Arguments.
-        self.args = get_args()
-        # 0. Load config
-        # with open(model_config) as fin:
-        #     self.config = json.load(fin, object_hook=lambda d: SimpleNamespace(**d))
+        self.store = ImageStore()
+        # Test
+        self.WaveGlow = utils.get_WaveGlow()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        self.initialize_distributed(self.args)
+        print("use griffin-lim and waveglow")
+        self.model = self.get_DNN(args.step)
 
-        # Random seeds for reproducability.
-        self.set_random_seed(self.args.seed)
 
-        # get the tokenizer
-        self.tokenizer = GPT2Tokenizer(os.path.join(self.args.tokenizer_path, 'vocab.json'),
-                                  os.path.join(self.args.tokenizer_path, 'chinese_vocab.model'))
-
-        self.args.parallel_output = False
-        self.model = self.setup_model(self.args)
-        self.args.batch_size = 1
+        # s_t = time.perf_counter()
+        # for i in range(100):
+        #     for _, phn in enumerate(data_list):
+        #         _, _, = self.synthesis(self.model, phn, args.alpha)
+        #     print(i)
+        # e_t = time.perf_counter()
+        # print((e_t - s_t) / 100.)
 
         logger.info("###")
 
-    def initialize_distributed(self, args):
-        """Initialize torch.distributed."""
-
-        # Manually set the device ids.
-        device = args.rank % torch.cuda.device_count()
-        if args.local_rank is not None:
-            device = args.local_rank
-        if device_affinity:
-            device = int(device_affinity)
-        print('device:',device)
-        self.device = device
-        torch.cuda.set_device(device)
-        # Call the init process
-        init_method = 'tcp://'
-        master_ip = os.getenv('MASTER_ADDR', 'localhost')
-        master_port = os.getenv('MASTER_PORT', '6000')
-        # init_method += master_ip + ':' + master_port
-        init_method += master_ip + ':' + '12580'[:-1] + str(device_affinity)
-        torch.distributed.init_process_group(
-            backend=args.distributed_backend,
-            world_size=args.world_size, rank=args.rank,
-            init_method=init_method)
-
-        # Set the model-parallel / data-parallel communicators.
-        mpu.initialize_model_parallel(args.model_parallel_size)
-
-    def set_random_seed(self, seed):
-        """Set random seed for reproducability."""
-
-        if seed is not None and seed > 0:
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-            mpu.model_parallel_cuda_manual_seed(seed)
-
-    def get_model(self, args):
-        """Build the model."""
-
-        print_rank_0('building CPM model ...')
-        self.model = GPT2Model(num_layers=args.num_layers,
-                          vocab_size=args.vocab_size,
-                          hidden_size=args.hidden_size,
-                          num_attention_heads=args.num_attention_heads,
-                          embedding_dropout_prob=args.hidden_dropout,
-                          attention_dropout_prob=args.attention_dropout,
-                          output_dropout_prob=args.hidden_dropout,
-                          max_sequence_length=args.max_position_embeddings,
-                          checkpoint_activations=args.checkpoint_activations,
-                          checkpoint_num_layers=args.checkpoint_num_layers,
-                          parallel_output=args.parallel_output)
-
-        if mpu.get_data_parallel_rank() == 0:
-            print(' > number of parameters on model parallel rank {}: {}'.format(
-                mpu.get_model_parallel_rank(),
-                sum([p.nelement() for p in self.model.parameters()])), flush=True)
-
-        # GPU allocation.
-        self.model.cuda(torch.cuda.current_device())
-
-        # Fp16 conversion.
-        if args.fp16:
-            self.model = FP16_Module(self.model)
-
-        # Wrap model for distributed training.
-        if USE_TORCH_DDP:
-            i = torch.cuda.current_device()
-            self.model = DDP(self.model, device_ids=[i], output_device=i,
-                        process_group=mpu.get_data_parallel_group())
-        else:
-            self.model = DDP(self.model)
-
-        return self.model
-
-    def setup_model(self, args):
-        """Setup model."""
-
-        self.model = self.get_model(args)
-
-        args.iteration = load_checkpoint_model(self.model, args)
-
-        return self.model
-
-
-    def get_masks_and_position_ids(self, data,
-                                   eod_token,
-                                   reset_position_ids,
-                                   reset_attention_mask):
-        # Extract batch size and sequence length.
-        batch_size, seq_length = data.size()
-
-        # Attention mask (lower triangular).
-        if reset_attention_mask:
-            att_mask_batch = batch_size
-        else:
-            att_mask_batch = 1
-        attention_mask = torch.tril(torch.ones(
-            (att_mask_batch, seq_length, seq_length), device=data.device)).view(
-            att_mask_batch, 1, seq_length, seq_length)
-
-        # Loss mask.
-        loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
-        loss_mask[data == eod_token] = 0.0
-
-        # Position ids.
-        position_ids = torch.arange(seq_length, dtype=torch.long,
-                                    device=data.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(data)
-        # We need to clone as the ids will be modifed based on batch index.
-        if reset_position_ids:
-            position_ids = position_ids.clone()
-
-        if reset_position_ids or reset_attention_mask:
-            # Loop through the batches:
-            for b in range(batch_size):
-
-                # Find indecies where EOD token is.
-                eod_index = position_ids[b, data[b] == eod_token]
-                # Detach indecies from positions if going to modify positions.
-                if reset_position_ids:
-                    eod_index = eod_index.clone()
-
-                # Loop through EOD indecies:
-                prev_index = 0
-                for j in range(eod_index.size()[0]):
-                    i = eod_index[j]
-                    # Mask attention loss.
-                    if reset_attention_mask:
-                        attention_mask[b, 0, (i + 1):, :(i + 1)] = 0
-                    # Reset positions.
-                    if reset_position_ids:
-                        position_ids[b, (i + 1):] -= (i + 1 - prev_index)
-                        prev_index = i + 1
-
-        return attention_mask, loss_mask, position_ids
-
-
-    def get_batch(self, context_tokens, device, args):
-        tokens = context_tokens
-        tokens = tokens.view(args.batch_size, -1).contiguous()
-        tokens = tokens.to(device)
-
-        # Get the masks and postition ids.
-        attention_mask, loss_mask, position_ids = self.get_masks_and_position_ids(
-            tokens,
-            args.eod_token,
-            args.reset_position_ids,
-            args.reset_attention_mask)
-
-        return tokens, attention_mask, position_ids
-
-    def top_k_logits(self, logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
-        # This function has been mostly taken from huggingface conversational ai code at
-        # https://medium.com/huggingface/how-to-build-a-state-of-the-art-conversational-ai-with-transfer-learning-2d818ac26313
-
-        if top_k > 0:
-            # Remove all tokens with a probability less than the last token of the top-k
-            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits[indices_to_remove] = filter_value
-
-        if top_p > 0.0:
-            # convert to 1D
-            logits = logits.view(logits.size()[1]).contiguous()
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-            # Remove tokens with cumulative probability above the threshold
-            sorted_indices_to_remove = cumulative_probs > top_p
-            # Shift the indices to the right to keep also the first token above the threshold
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            logits[indices_to_remove] = filter_value
-            # going back to 2D
-            logits = logits.view(1, -1).contiguous()
-
-        return logits
-
-    def generate_samples(self, config, model, tokenizer, args, device):  # 产出文本
-        raw_text = config['prompt']
-        output_len = config.get('length', args.out_seq_length)
-        top_k = config.get('top_k', args.top_k)
-        top_p = config.get('top_p', args.top_p)
-        temperature = config.get('temperature', args.temperature)
-        print_rank_0(raw_text)
-        context_count = 0
+    def get_DNN(self, num):
+        checkpoint_path = "checkpoint_" + str(num) + ".pth.tar"
+        model = nn.DataParallel(M.FastSpeech()).to(self.device)
+        model.load_state_dict(torch.load(os.path.join(hp.checkpoint_path,
+                                                      checkpoint_path))['model'])
         model.eval()
-        with torch.no_grad():  # 关闭自动求导引擎
-            # while True:  # 当循环不中止的时候一直进行下去
-            #     torch.distributed.barrier(group=mpu.get_model_parallel_group())
-            terminate_runs = 0
-            # <操作1>在此处直接写规则（函数另其对对话进行直接返回）
-            if mpu.get_model_parallel_rank() == 0:
-                # if args.input_text:  # 如果满足，则raw_text取example.txt
-                #     # 交互式文本
-                #     raw_text = open(args.input_text).read().strip()
-                # else:
-                #     raw_text = input("\nContext prompt (stop to exit) >>> ")
-                #     while not raw_text:
-                #         print('Prompt should not be empty!')
-                #         raw_text = input("\nContext prompt (stop to exit) >>> ")
+        return model
 
-                # if "stop" in raw_text:
-                #     terminate_runs = 1  # 终止信号，为1则终止；为0则继续
-                # else:
-                # context_tokens = tokenizer.EncodeAsIds(raw_text).tokenization
-                context_tokens = tokenizer.encode(raw_text)  # 得到了经过分词后的list:token_id  [t1,t2,t3,...,tn]
-                context_length = len(context_tokens)  # 获取这些tokenid list的长度
+    def synthesis(self, model, text, alpha=1.0):
+        text = np.array(text)
+        text = np.stack([text])
+        src_pos = np.array([i + 1 for i in range(text.shape[1])])
+        src_pos = np.stack([src_pos])
+        sequence = torch.from_numpy(text).cuda().long()
+        src_pos = torch.from_numpy(src_pos).cuda().long()
 
-                if context_length >= args.seq_length // 2:
-                    print("\nContext length ", context_length, \
-                          "\nPlease give smaller context (half of the sequence length)!")
-                    return "\nContext length " + str(context_length) + \
-                          "\nPlease give smaller context (half of the sequence length)!"
-                    # continue  # 重新输入
-            else:
-                # context_tokens = tokenizer.EncodeAsIds("EMPTY TEXT").tokenization
-                context_tokens = tokenizer.encode("空文本")
-                context_length = len(context_tokens)
-            # print_rank_0(context_tokens)
-            # terminate_runs_tensor = torch.cuda.LongTensor([terminate_runs])
-            # torch.distributed.broadcast(terminate_runs_tensor, mpu.get_model_parallel_src_rank(),
-            #                             group=mpu.get_model_parallel_group())
-            # terminate_runs = terminate_runs_tensor[0].item()
+        with torch.no_grad():
+            _, mel = model.module.forward(sequence, src_pos, alpha=alpha)
+        return mel[0].cpu().transpose(0, 1), mel.contiguous().transpose(1, 2)
 
-            # if terminate_runs == 1:
-            #     return
-            # <操作2>保存中间变量，并开始写规则和循环让模型预测进行回溯继续预测(可以找一下topk的排序预测问题)：
-            pad_id = tokenizer.encoder['<pad>']
-            args.eod_token = tokenizer.encoder['<eod>']
-            if context_length < args.seq_length:
-                context_tokens.extend([pad_id] * (args.seq_length - context_length))
+    def get_data(self, texts):
+        data_list = list()
+        for text in texts:
+            data_list.append(text.text_to_sequence(text, hp.text_cleaners))
+        return data_list
 
-            context_tokens_tensor = torch.cuda.LongTensor(context_tokens)
-            context_length_tensor = torch.cuda.LongTensor([context_length])
-            # print_rank_0(context_tokens_tensor)
-
-            # torch.distributed.broadcast(context_length_tensor, mpu.get_model_parallel_src_rank(),
-            #                             group=mpu.get_model_parallel_group())
-            # torch.distributed.broadcast(context_tokens_tensor, mpu.get_model_parallel_src_rank(),
-            #                             group=mpu.get_model_parallel_group())
-            # print_rank_0(context_tokens_tensor)
-            context_length = context_length_tensor[0].item()
-            tokens, attention_mask, position_ids = self.get_batch(context_tokens_tensor, device, args)
-
-            start_time = time.time()
-
-            counter = 0
-            org_context_length = context_length
-
-            past_key_values = None
-            while counter < (org_context_length + output_len):  # 使用GPT2进行反复生成式得到回答？<可以在中间测一下>
-                # print('test')
-                if counter == 0:
-                    # print_rank_0(tokens[:, :context_length])
-                    logits, past_key_values = model(tokens[:, :context_length], position_ids[:, :context_length],
-                                                    attention_mask[:, :, :context_length, :context_length],
-                                                    past_key_values=past_key_values, use_cache=True)
-                    logits = logits[:, context_length - 1, :]
-                    counter += context_length
-                    # print_rank_0(logits)
-                else:
-                    # print_rank_0(tokens[:, context_length - 1: context_length])
-                    logits, past_key_values = model(tokens[:, context_length - 1: context_length],
-                                                    position_ids[:, context_length - 1: context_length],
-                                                    attention_mask[:, :, context_length - 1, :context_length],
-                                                    past_key_values=past_key_values, use_cache=True)
-                    logits = logits[:, 0, :]
-                    # print_rank_0(logits)
-
-                past_key_values = [x.half() for x in past_key_values]
-                logits = self.top_k_logits(logits, top_k=top_k, top_p=top_p)
-                log_probs = F.softmax(logits / temperature, dim=-1)
-                prev = torch.multinomial(log_probs, num_samples=1)
-                tokens[0, context_length] = prev[0]
-                # print_rank_0(tokens[0, context_length])
-                # torch.distributed.broadcast(tokens, mpu.get_model_parallel_src_rank(),
-                #                             group=mpu.get_model_parallel_group())
-                context_length += 1
-                counter += 1
-
-                output_tokens_list = tokens.view(-1).contiguous()
-                decode_tokens = tokenizer.decode(output_tokens_list.tolist())
-                token_end = decode_tokens.find("<eod>")
-
-                # if mpu.get_model_parallel_rank() == 0 and (counter % 16 == 0 or token_end != -1):
-                #     # os.system('clear')
-                #     print("\nTaken time {:.2f}\n".format(time.time() - start_time), flush=True)
-                #     print("\nContext:", raw_text, flush=True)
-                #     trim_decode_tokens = decode_tokens[len(raw_text):decode_tokens.find("<eod>")]
-                #     print("\nCPM:", trim_decode_tokens, flush=True)
-
-                if token_end != -1:
-                    # print(token_end)
-                    break
-
-            if mpu.get_model_parallel_rank() == 0:
-                # os.system('clear')
-                print("\nTaken time {:.2f}\n".format(time.time() - start_time), flush=True)
-                print("\nContext:", raw_text, flush=True)
-                output_tokens_list = tokens.view(-1).contiguous()
-                decode_tokens = tokenizer.decode(output_tokens_list.tolist())
-                trim_decode_tokens = decode_tokens[len(raw_text):decode_tokens.find("<eod>")]
-                print("\nCPM:", trim_decode_tokens, flush=True)
-
-                # print(token_end)
-            #raw_text = None
-
-            # torch.distributed.barrier(group=mpu.get_model_parallel_group())
-            context_count += 1
-
-            # if args.input_text:
-            #     break
-            return trim_decode_tokens
 
     def gpt_generate(self, jsondata):
         logger.info(jsondata)
-        number = jsondata.get('number', 3)
-        answer_list = []
-        for _ in range(number):
-            answer_list.append(self.generate_samples(jsondata, self.model, self.tokenizer, self.args, torch.cuda.current_device()))
-        return {"result": answer_list}
+        # test1 = "I am very happy to see you again!"
+        # test2 = "Durian model is a very good speech synthesis!"
+        # test3 = "When I was twenty, I fell in love with a girl."
+        # test4 = "I remove attention module in decoder and use average pooling to implement predicting r frames at once"
+        # test5 = "You can not improve your past, but you can improve your future. Once time is wasted, life is wasted."
+        # test6 = "Death comes to all, but great achievements raise a monument which shall endure until the sun grows old."
+        text = jsondata['text']
+        # data_list = self.get_data(texts)
+        # for i, phn in enumerate(data_list):
+        #     mel, mel_cuda = self.synthesis(self.model, phn, args.alpha)
+        #     if not os.path.exists("results"):
+        #         os.mkdir("results")
+        #     audio.tools.inv_mel_spec(
+        #         mel, "results/" + str(args.step) + "_" + str(i) + ".wav")
+        #     waveglow.inference.inference(
+        #         mel_cuda, self.WaveGlow,
+        #         "results/" + str(args.step) + "_" + str(i) + "_waveglow.wav")
+        #     print("Done", i + 1)
+        textbin = text.text_to_sequence(text, hp.text_cleaners)
+        _, mel_cuda = self.synthesis(self.model, textbin, args.alpha)
+        if not os.path.exists("results"):
+            os.mkdir("results")
+        temp_file = "results/" + str(args.step) + "_" + str(0) + "_waveglow.wav"
+        waveglow.inference.inference(
+            mel_cuda, self.WaveGlow,temp_file)
+        stream, len = self.store.open(temp_file)
+        return stream
 
     def on_get(self, req, resp):
         logger.info("...")
@@ -428,7 +200,7 @@ class TorchResource:
         print('device:', self.device)
         resp.media = self.gpt_generate(jsondata)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     api = falcon.API(middleware=[cors_allow_all.middleware])
     api.req_options.auto_parse_form_urlencoded = True
     api.add_route('/z', TorchResource())
