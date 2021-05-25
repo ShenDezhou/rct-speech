@@ -44,14 +44,15 @@ cors_allow_all = CORS(allow_all_origins=True,
                       )
 
 parser = argparse.ArgumentParser()
+parser.add_argument('-p', '--port', type=int, default=8010)
 parser.add_argument('--step', type=int, default=336000)
 parser.add_argument("--alpha", type=float, default=1.0)
 args = parser.parse_args()
 # args = parser.parse_args()
-port = os.getenv('TO_PORT', 8010)
-device_affinity = os.getenv('DEVICE_AFFINITY', 0)
+# port = os.getenv('TO_PORT', 8010)
+device_affinity = os.getenv('DEVICE_AFFINITY', 1)
 # model_config= 'config/config.json'
-#torch.cuda.set_device(int(device_affinity))
+torch.cuda.set_device(int(device_affinity))
 # class ImageStore:
 #
 #     _CHUNK_SIZE_BYTES = 4096
@@ -117,8 +118,12 @@ class TorchResource:
         text = np.stack([text])
         src_pos = np.array([i + 1 for i in range(text.shape[1])])
         src_pos = np.stack([src_pos])
-        sequence = torch.from_numpy(text).long()
-        src_pos = torch.from_numpy(src_pos).long()
+        if torch.cuda.is_available():
+            sequence = torch.from_numpy(text).cuda().long()
+            src_pos = torch.from_numpy(src_pos).cuda().long()
+        else:
+            sequence = torch.from_numpy(text).long()
+            src_pos = torch.from_numpy(src_pos).long()
 
         with torch.no_grad():
             _, mel = model.module.forward(sequence, src_pos, alpha=alpha)
@@ -158,6 +163,7 @@ class TorchResource:
         # content = req.get_param('2', True)
         # clean_title = shortenlines(title)
         # clean_content = cleanall(content)
+        torch.cuda.set_device(int(device_affinity))
         resp.content_type = 'audio/*'
         resp.stream = self.gpt_generate({"text": text})
         logger.info("###")
@@ -174,7 +180,7 @@ class TorchResource:
         jsondata = json.loads(data)
         # clean_title = shortenlines(jsondata.title)
         # clean_content = cleanall(jsondata.content)
-        torch.cuda.set_device(self.device)
+        torch.cuda.set_device(int(device_affinity))
         print('device:', self.device)
         resp.content_type = 'audio/*'
         resp.stream = self.gpt_generate(jsondata)
@@ -183,4 +189,4 @@ if __name__ == "__main__":
     api = falcon.API(middleware=[cors_allow_all.middleware])
     api.req_options.auto_parse_form_urlencoded = True
     api.add_route('/z', TorchResource())
-    waitress.serve(api, port=port, threads=48, url_scheme='http')
+    waitress.serve(api, port=args.port, threads=48, url_scheme='http')

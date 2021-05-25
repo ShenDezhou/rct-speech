@@ -5,3 +5,6 @@ librosa==0.7.2
 inflect==0.2.5
 numba==0.48.0
 unidecode
+falcon>=3.0.0
+falcon-cors>=1.1.7
+waitress>=2.0.0
