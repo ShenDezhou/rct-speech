@@ -44,7 +44,7 @@ cors_allow_all = CORS(allow_all_origins=True,
                       )
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--step', type=int, default=0)
+parser.add_argument('--step', type=int, default=336000)
 parser.add_argument("--alpha", type=float, default=1.0)
 args = parser.parse_args()
 # args = parser.parse_args()
@@ -52,73 +52,63 @@ port = os.getenv('TO_PORT', 8010)
 device_affinity = os.getenv('DEVICE_AFFINITY', 0)
 # model_config= 'config/config.json'
 #torch.cuda.set_device(int(device_affinity))
-class ImageStore:
-
-    _CHUNK_SIZE_BYTES = 4096
-    _IMAGE_NAME_PATTERN = re.compile(
-        '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-z]{2,4}$'
-    )
-
-    def __init__(self, storage_path, uuidgen=uuid.uuid4, fopen=io.open):
-        self._storage_path = storage_path
-        self._uuidgen = uuidgen
-        self._fopen = fopen
-
-    def save(self, image_stream, image_content_type):
-        ext = mimetypes.guess_extension(image_content_type)
-        name = '{uuid}{ext}'.format(uuid=self._uuidgen(), ext=ext)
-        image_path = os.path.join(self._storage_path, name)
-
-        with self._fopen(image_path, 'wb') as image_file:
-            while True:
-                chunk = image_stream.read(self._CHUNK_SIZE_BYTES)
-                if not chunk:
-                    break
-
-                image_file.write(chunk)
-
-        return name
-
-    def open(self, name):
-        # Always validate untrusted input!
-        if not self._IMAGE_NAME_PATTERN.match(name):
-            raise IOError('File not found')
-
-        image_path = os.path.join(self._storage_path, name)
-        stream = self._fopen(image_path, 'rb')
-        content_length = os.path.getsize(image_path)
-
-        return stream, content_length
+# class ImageStore:
+#
+#     _CHUNK_SIZE_BYTES = 4096
+#     _IMAGE_NAME_PATTERN = re.compile(
+#         '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-z]{2,4}$'
+#     )
+#
+#     def __init__(self, storage_path, uuidgen=uuid.uuid4, fopen=io.open):
+#         self._storage_path = storage_path
+#         self._uuidgen = uuidgen
+#         self._fopen = fopen
+#
+#     def save(self, image_stream, image_content_type):
+#         ext = mimetypes.guess_extension(image_content_type)
+#         name = '{uuid}{ext}'.format(uuid=self._uuidgen(), ext=ext)
+#         image_path = os.path.join(self._storage_path, name)
+#
+#         with self._fopen(image_path, 'wb') as image_file:
+#             while True:
+#                 chunk = image_stream.read(self._CHUNK_SIZE_BYTES)
+#                 if not chunk:
+#                     break
+#
+#                 image_file.write(chunk)
+#
+#         return name
+#
+#     def open(self, name):
+#         # Always validate untrusted input!
+#         # if not self._IMAGE_NAME_PATTERN.match(name):
+#         #     raise IOError('File not found')
+#
+#         image_path = os.path.join(self._storage_path, name)
+#         stream = self._fopen(image_path, 'rb')
+#         content_length = os.path.getsize(image_path)
+#
+#         return stream, content_length
 
 class TorchResource:
 
     def __init__(self):
         logger.info("...")
         # Arguments.
-        self.store = ImageStore()
+        # self.store = ImageStore(storage_path='.')
         # Test
         self.WaveGlow = utils.get_WaveGlow()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         print("use griffin-lim and waveglow")
         self.model = self.get_DNN(args.step)
-
-
-        # s_t = time.perf_counter()
-        # for i in range(100):
-        #     for _, phn in enumerate(data_list):
-        #         _, _, = self.synthesis(self.model, phn, args.alpha)
-        #     print(i)
-        # e_t = time.perf_counter()
-        # print((e_t - s_t) / 100.)
-
         logger.info("###")
 
     def get_DNN(self, num):
         checkpoint_path = "checkpoint_" + str(num) + ".pth.tar"
         model = nn.DataParallel(M.FastSpeech()).to(self.device)
         model.load_state_dict(torch.load(os.path.join(hp.checkpoint_path,
-                                                      checkpoint_path))['model'])
+                                                      checkpoint_path), map_location=self.device)['model'])
         model.eval()
         return model
 
@@ -127,8 +117,8 @@ class TorchResource:
         text = np.stack([text])
         src_pos = np.array([i + 1 for i in range(text.shape[1])])
         src_pos = np.stack([src_pos])
-        sequence = torch.from_numpy(text).cuda().long()
-        src_pos = torch.from_numpy(src_pos).cuda().long()
+        sequence = torch.from_numpy(text).long()
+        src_pos = torch.from_numpy(src_pos).long()
 
         with torch.no_grad():
             _, mel = model.module.forward(sequence, src_pos, alpha=alpha)
@@ -149,27 +139,14 @@ class TorchResource:
         # test4 = "I remove attention module in decoder and use average pooling to implement predicting r frames at once"
         # test5 = "You can not improve your past, but you can improve your future. Once time is wasted, life is wasted."
         # test6 = "Death comes to all, but great achievements raise a monument which shall endure until the sun grows old."
-        text = jsondata['text']
-        # data_list = self.get_data(texts)
-        # for i, phn in enumerate(data_list):
-        #     mel, mel_cuda = self.synthesis(self.model, phn, args.alpha)
-        #     if not os.path.exists("results"):
-        #         os.mkdir("results")
-        #     audio.tools.inv_mel_spec(
-        #         mel, "results/" + str(args.step) + "_" + str(i) + ".wav")
-        #     waveglow.inference.inference(
-        #         mel_cuda, self.WaveGlow,
-        #         "results/" + str(args.step) + "_" + str(i) + "_waveglow.wav")
-        #     print("Done", i + 1)
-        textbin = text.text_to_sequence(text, hp.text_cleaners)
+        content = jsondata['text']
+
+        textbin = text.text_to_sequence(content, hp.text_cleaners)
         _, mel_cuda = self.synthesis(self.model, textbin, args.alpha)
-        if not os.path.exists("results"):
-            os.mkdir("results")
-        temp_file = "results/" + str(args.step) + "_" + str(0) + "_waveglow.wav"
+        temp_file = io.BytesIO()
         waveglow.inference.inference(
-            mel_cuda, self.WaveGlow,temp_file)
-        stream, len = self.store.open(temp_file)
-        return stream
+            mel_cuda, self.WaveGlow, temp_file)
+        return temp_file
 
     def on_get(self, req, resp):
         logger.info("...")
@@ -177,11 +154,12 @@ class TorchResource:
         resp.set_header('Access-Control-Allow-Methods', '*')
         resp.set_header('Access-Control-Allow-Headers', '*')
         resp.set_header('Access-Control-Allow-Credentials','true')
-        jsondata = req.get_param('json', True)
+        text = req.get_param('text', True)
         # content = req.get_param('2', True)
         # clean_title = shortenlines(title)
         # clean_content = cleanall(content)
-        resp.media = self.gpt_generate(jsondata)
+        resp.content_type = 'audio/*'
+        resp.stream = self.gpt_generate({"text": text})
         logger.info("###")
 
 
@@ -198,7 +176,8 @@ class TorchResource:
         # clean_content = cleanall(jsondata.content)
         torch.cuda.set_device(self.device)
         print('device:', self.device)
-        resp.media = self.gpt_generate(jsondata)
+        resp.content_type = 'audio/*'
+        resp.stream = self.gpt_generate(jsondata)
 
 if __name__ == "__main__":
     api = falcon.API(middleware=[cors_allow_all.middleware])

@@ -267,9 +267,14 @@ class WaveGlow(torch.nn.Module):
                                           self.n_remaining_channels,
                                           spect.size(2)).normal_()
         else:
-            audio = torch.cuda.FloatTensor(spect.size(0),
-                                           self.n_remaining_channels,
-                                           spect.size(2)).normal_()
+            if torch.cuda.is_available():
+                audio = torch.cuda.FloatTensor(spect.size(0),
+                                               self.n_remaining_channels,
+                                               spect.size(2)).normal_()
+            else:
+                audio = torch.FloatTensor(spect.size(0),
+                                               self.n_remaining_channels,
+                                               spect.size(2)).normal_()
 
         audio = torch.autograd.Variable(sigma*audio)
 
@@ -291,8 +296,12 @@ class WaveGlow(torch.nn.Module):
                     z = torch.cuda.HalfTensor(spect.size(
                         0), self.n_early_size, spect.size(2)).normal_()
                 else:
-                    z = torch.cuda.FloatTensor(spect.size(
-                        0), self.n_early_size, spect.size(2)).normal_()
+                    if torch.cuda.is_available():
+                        z = torch.cuda.FloatTensor(spect.size(
+                            0), self.n_early_size, spect.size(2)).normal_()
+                    else:
+                        z = torch.FloatTensor(spect.size(
+                            0), self.n_early_size, spect.size(2)).normal_()
                 audio = torch.cat((sigma*z, audio), 1)
 
         audio = audio.permute(0, 2, 1).contiguous().view(
