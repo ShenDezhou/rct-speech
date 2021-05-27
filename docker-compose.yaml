@@ -1,0 +1,10 @@
+services:
+  web:
+    image: bangtech/speech:latest
+    environment:
+      - gpus=all
+    network_mode: "bridge"
+    ports:
+      - 58076:58076
+    container_name: speech
+    command: python3 to_api_server.py -p 58076 --step 405000

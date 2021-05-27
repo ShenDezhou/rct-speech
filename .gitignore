@@ -114,3 +114,4 @@ mels
 alignments
 waveglow/pretrained_model
 sample/
+*.patch
